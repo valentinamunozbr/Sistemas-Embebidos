@@ -1,0 +1,251 @@
+#include <DHT.h>
+#include <AsyncTaskLib.h>
+
+// --- Configuración de sensores y LEDs ---
+#define DHTPIN 15
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+#define LDR_PIN 34
+#define LED_AZUL 4
+#define LED_ROJO 5
+
+// --- Tiempos de parpadeo ---
+#define LED_BLUE_ON 100
+#define LED_BLUE_OFF 800
+#define LED_RED_ON 200
+#define LED_RED_OFF 900
+
+// --- Timeouts (ms) ---
+#define TIMEOUT_INICIO 5000
+#define TIMEOUT_MONITOREO_TYH 7000
+#define TIMEOUT_MONITOREO_LUZ 7000
+#define TIMEOUT_ALERTA 4000
+#define TIMEOUT_ALARMA 3000
+
+// --- Umbrales ---
+#define TEMPERATURA_UMBRAL 26.5
+#define LUZ_UMBRAL 2000
+
+// --- Variables ---
+float temperatura = 0.0;
+float humedad = 0.0;
+int luz = 0;
+
+enum Estado { Inicio, MonitoreoTyH, MonitoreoLuz, Alerta, Alarma };
+Estado estadoActual = Inicio;
+
+// Parpadeo LEDs 
+unsigned long lastLedChange = 0;
+bool ledState = false;
+
+// --- Control de timeout por tareas ---
+const unsigned long TICK_MS = 100; // periodo del ticker
+unsigned long ticksObjetivo = 0;   // cuántos ticks debe durar el estado actual
+unsigned long ticksAcumulados = 0; // cuántos ticks han pasado en el estado actual
+
+// Declaración de funciones
+void cambiarEstado(Estado nuevoEstado, unsigned long duracion);
+void handleSensores();
+void handleLEDs();
+void handleSerial();
+void handleTicker();
+void handleFSM(); 
+
+// --- Tareas AsyncTaskLib ---
+AsyncTask taskSensores(1000, &handleSensores);
+AsyncTask taskLEDs(100, &handleLEDs);
+AsyncTask taskSerial(100, &handleSerial);
+AsyncTask taskTicker(TICK_MS, &handleTicker); // suma ticks
+AsyncTask taskFSM(50, &handleFSM);            // verifica timeout y cambia estado
+
+// --- Implementación de handlers ---
+void handleSensores() {
+  // Lectura de sensores 
+  humedad = dht.readHumidity();
+  temperatura = dht.readTemperature();
+  luz = analogRead(LDR_PIN);
+
+  // Mostrar lecturas según estado
+  switch (estadoActual) {
+    case MonitoreoTyH:
+    case Alerta:
+      Serial.print("Temperatura: ");
+      Serial.print(temperatura);
+      Serial.print(" °C | Humedad: ");
+      Serial.print(humedad);
+      Serial.print(" %");
+      if (temperatura > TEMPERATURA_UMBRAL) Serial.print(" | ⚠️  ALTA!");
+      Serial.println();
+      break;
+
+    case MonitoreoLuz:
+    case Alarma:
+      Serial.print("Luz: ");
+      Serial.print(luz);
+      if (luz > LUZ_UMBRAL) Serial.print(" | ⚠️  ALTA!");
+      Serial.println();
+      break;
+
+    case Inicio:
+      // No mostrar lecturas en estado Inicio
+      break;
+  }
+
+  // Transiciones automáticas por umbrales
+  if (estadoActual == MonitoreoTyH && temperatura > TEMPERATURA_UMBRAL) {
+    Serial.println("  TEMPERATURA ALTA DETECTADA! Pasando a Alerta");
+    cambiarEstado(Alerta, TIMEOUT_ALERTA);
+  }
+  if (estadoActual == MonitoreoLuz && luz > LUZ_UMBRAL) {
+    Serial.println("  LUZ ALTA DETECTADA! Pasando a Alarma");
+    cambiarEstado(Alarma, TIMEOUT_ALARMA);
+  }
+}
+
+void handleLEDs() {
+  // Control de LEDs (parpadeo)
+  if (estadoActual != Alerta && estadoActual != Alarma) {
+    digitalWrite(LED_AZUL, LOW);
+    digitalWrite(LED_ROJO, LOW);
+    return;
+  }
+
+  unsigned long ahora = millis();
+  unsigned long intervalo = 0;
+  int ledPin = 0;
+
+  if (estadoActual == Alerta) {
+    intervalo = ledState ? LED_BLUE_ON : LED_BLUE_OFF;
+    ledPin = LED_AZUL;
+    digitalWrite(LED_ROJO, LOW);
+  } else if (estadoActual == Alarma) {
+    intervalo = ledState ? LED_RED_ON : LED_RED_OFF;
+    ledPin = LED_ROJO;
+    digitalWrite(LED_AZUL, LOW);
+  }
+
+  if (ahora - lastLedChange >= intervalo) {
+    ledState = !ledState;
+    digitalWrite(ledPin, ledState ? HIGH : LOW);
+    lastLedChange = ahora;
+  }
+}
+
+void handleSerial() {
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (estadoActual == Alerta && (c == 'a' || c == 'A')) {
+      Serial.println(" Tecla 'a' recibida → Volviendo a INICIO");
+      cambiarEstado(Inicio, TIMEOUT_INICIO);
+    }
+    if (estadoActual == Alarma && (c == 'b' || c == 'B')) {
+      Serial.println(" Tecla 'b' recibida → Volviendo a INICIO");
+      cambiarEstado(Inicio, TIMEOUT_INICIO);
+    }
+  }
+}
+
+// Ticker: solo suma “ticks” 
+void handleTicker() {
+  ticksAcumulados++; // +1 tick cada TICK_MS
+}
+
+// FSM por timeout: decide si ya se cumplió el tiempo del estado y transiciona
+void handleFSM() {
+  if (ticksAcumulados >= ticksObjetivo) {
+    Serial.println("⏰ Timeout alcanzado (por ticks) - Cambiando estado");
+    switch (estadoActual) {
+      case Inicio:
+        cambiarEstado(MonitoreoTyH, TIMEOUT_MONITOREO_TYH);
+        break;
+      case MonitoreoTyH:
+        cambiarEstado(MonitoreoLuz, TIMEOUT_MONITOREO_LUZ);
+        break;
+      case MonitoreoLuz:
+        cambiarEstado(MonitoreoTyH, TIMEOUT_MONITOREO_TYH);
+        break;
+      case Alerta:
+        cambiarEstado(MonitoreoTyH, TIMEOUT_MONITOREO_TYH);
+        break;
+      case Alarma:
+        cambiarEstado(MonitoreoLuz, TIMEOUT_MONITOREO_LUZ);
+        break;
+    }
+  }
+}
+
+// --- Cambio de estado ---
+void cambiarEstado(Estado nuevoEstado, unsigned long duracion) {
+  estadoActual = nuevoEstado;
+
+  // Rearmar timeout usando ticks del ticker
+  ticksAcumulados = 0;
+  ticksObjetivo = (duracion + (TICK_MS - 1)) / TICK_MS; // redondeo hacia arriba
+
+  Serial.print("⏳ Nuevo timeout configurado (ms): ");
+  Serial.println(duracion);
+
+  // Reiniciar parpadeo LEDs (cadencia visual)
+  lastLedChange = millis();
+  ledState = true;
+
+  // Apagar ambos LEDs al cambiar de estado
+  digitalWrite(LED_AZUL, LOW);
+  digitalWrite(LED_ROJO, LOW);
+
+  // Mensajes de estado
+  switch (estadoActual) {
+    case Inicio:
+      Serial.println("\n=== ESTADO: INICIO ===");
+      break;
+    case MonitoreoTyH:
+      Serial.println("\n=== ESTADO: MONITOREO TyH ===");
+      break;
+    case MonitoreoLuz:
+      Serial.println("\n=== ESTADO: MONITOREO LUZ ===");
+      break;
+    case Alerta:
+      Serial.println("\n=== ESTADO: ALERTA ===");
+      digitalWrite(LED_AZUL, HIGH); // Encender LED azul en alerta
+      break;
+    case Alarma:
+      Serial.println("\n=== ESTADO: ALARMA ===");
+      digitalWrite(LED_ROJO, HIGH); // Encender LED rojo en alarma
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+
+  pinMode(LED_AZUL, OUTPUT);
+  pinMode(LED_ROJO, OUTPUT);
+
+  // Configurar tareas
+  taskSensores.AutoReset = true;
+  taskLEDs.AutoReset     = true;
+  taskSerial.AutoReset   = true;
+  taskTicker.AutoReset   = true;
+  taskFSM.AutoReset      = true;
+
+  // Iniciar tareas
+  taskSensores.Start();
+  taskLEDs.Start();
+  taskSerial.Start();
+  taskTicker.Start();
+  taskFSM.Start();
+
+  // Estado inicial
+  cambiarEstado(Inicio, TIMEOUT_INICIO);
+}
+
+void loop() {
+  taskSensores.Update();
+  taskLEDs.Update();
+  taskSerial.Update();
+  taskTicker.Update(); 
+  taskFSM.Update();    
+}
+
